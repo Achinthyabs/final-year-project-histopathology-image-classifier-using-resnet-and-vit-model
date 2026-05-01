@@ -1,0 +1,14 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+Balanced_Dataset/
+Processed_Dataset/
+Processed_Dataset_Split/
+Balanced_Dataset_Split/
+NCT-CRC-SPLIT/
+best_cnn_model.keras
+cnn_12class_model.keras
+final_cnn_model.keras
