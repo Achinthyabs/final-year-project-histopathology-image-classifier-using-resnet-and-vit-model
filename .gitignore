@@ -1,6 +1,7 @@
 venv/
 .venv/
 __pycache__/
+prediction_history/
 *.pyc
 *.pyo
 *.pyd

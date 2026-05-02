@@ -1,0 +1,5 @@
+.env/
+dataset_split/
+NCT-CRC-HE-100K/
+__pycache__/
+*.pyc
