@@ -1,6 +1,5 @@
 import customtkinter as ctk
 
-from animations import animate_content_in
 from ui_helpers import build_model_card, make_card
 
 
@@ -175,4 +174,51 @@ def show_home_page(app):
     app.chart_frame.pack(fill="x", padx=22, pady=(0, 18))
     app.chart_frame.pack_propagate(False)
     app.draw_metrics_chart()
-    animate_content_in(app)
+
+    app.thermal_card = make_card(app.content)
+    app.thermal_card.grid(
+        row=4,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(16, 0),
+    )
+    app.thermal_card.grid_columnconfigure(0, weight=1)
+
+    ctk.CTkLabel(
+        app.thermal_card,
+        text="Winning Model Thermal Detection",
+        font=ctk.CTkFont(size=20, weight="bold"),
+        text_color="#f7f8fc",
+    ).pack(anchor="w", padx=22, pady=(18, 4))
+
+    app.thermal_note = ctk.CTkLabel(
+        app.thermal_card,
+        text="Upload an image to generate a thermal map from the final winning model.",
+        text_color="#8e99ae",
+        font=ctk.CTkFont(size=12),
+        wraplength=900,
+        justify="left",
+    )
+    app.thermal_note.pack(anchor="w", padx=22, pady=(0, 10))
+
+    app.thermal_box = ctk.CTkFrame(
+        app.thermal_card,
+        height=330,
+        corner_radius=16,
+        fg_color="#111827",
+        border_color="#27314a",
+        border_width=1,
+    )
+    app.thermal_box.pack(fill="x", padx=22, pady=(0, 18))
+    app.thermal_box.pack_propagate(False)
+
+    app.thermal_label = ctk.CTkLabel(
+        app.thermal_box,
+        text="Thermal map appears after prediction",
+        text_color="#7f8aa3",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        wraplength=520,
+        justify="center",
+    )
+    app.thermal_label.pack(expand=True)

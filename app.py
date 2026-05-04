@@ -1,5 +1,6 @@
 import json
 import shutil
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from threading import Thread
@@ -14,16 +15,16 @@ import numpy as np
 import tensorflow as tf
 import timm
 import torch
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from PIL import Image, ImageOps
 from sklearn.metrics import classification_report
 from torchvision import transforms
 
 from about import show_about_page as render_about_page
-from animations import animate_content_in
+from front import show_front_page as render_front_page
 from history import show_history_page as render_history_page
 from home import show_home_page as render_home_page
+from thermal_detection import create_thermal_overlay
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,6 +46,9 @@ IMAGE_SIZE = (224, 224)
 DEVICE = "cpu"
 CNN_TEST_ACCURACY = 92.32
 VIT_TEST_ACCURACY = 97.85
+MIN_MODEL_CONFIDENCE = 0.60
+CNN_DISAGREEMENT_CONFIDENCE_THRESHOLD = 0.90
+DISAGREEMENT_SCORE_MARGIN = 0.05
 
 CNN_CLASS_NAMES = [
     "ADI",
@@ -85,6 +89,78 @@ def ranked_predictions(probabilities, class_names):
         }
         for index in top_indices
     ]
+
+
+def select_final_prediction(cnn_best, vit_best, cnn_score, vit_score):
+    cnn_confidence = cnn_best["confidence"]
+    vit_confidence = vit_best["confidence"]
+    cnn_is_reliable = cnn_confidence >= MIN_MODEL_CONFIDENCE
+    vit_is_reliable = vit_confidence >= MIN_MODEL_CONFIDENCE
+    models_agree = cnn_best["class_name"] == vit_best["class_name"]
+
+    if models_agree:
+        if vit_score > cnn_score:
+            return (
+                "ViT-Tiny",
+                vit_best,
+                vit_score,
+                "Both models agree on the class; ViT has the stronger adjusted score.",
+            )
+        return (
+            "ResNet-8 CNN",
+            cnn_best,
+            cnn_score,
+            "Both models agree on the class; CNN has the stronger adjusted score.",
+        )
+
+    if vit_is_reliable and not cnn_is_reliable:
+        return (
+            "ViT-Tiny",
+            vit_best,
+            vit_score,
+            f"Models disagree. CNN confidence is below the {MIN_MODEL_CONFIDENCE * 100:.0f}% reliability threshold, so ViT is selected.",
+        )
+
+    if cnn_is_reliable and not vit_is_reliable:
+        return (
+            "ResNet-8 CNN",
+            cnn_best,
+            cnn_score,
+            f"Models disagree. ViT confidence is below the {MIN_MODEL_CONFIDENCE * 100:.0f}% reliability threshold, so CNN is selected.",
+        )
+
+    if vit_is_reliable and cnn_score > vit_score:
+        score_gap = cnn_score - vit_score
+        cnn_can_override_vit = (
+            cnn_confidence >= CNN_DISAGREEMENT_CONFIDENCE_THRESHOLD
+            and score_gap >= DISAGREEMENT_SCORE_MARGIN
+        )
+        if not cnn_can_override_vit:
+            return (
+                "ViT-Tiny",
+                vit_best,
+                vit_score,
+                (
+                    "Models disagree. CNN did not pass the stricter disagreement rule "
+                    f"({CNN_DISAGREEMENT_CONFIDENCE_THRESHOLD * 100:.0f}% confidence and "
+                    f"{DISAGREEMENT_SCORE_MARGIN * 100:.0f}% score margin), so ViT is selected."
+                ),
+            )
+
+    if vit_score > cnn_score:
+        return (
+            "ViT-Tiny",
+            vit_best,
+            vit_score,
+            "Models disagree; ViT has the stronger adjusted score.",
+        )
+
+    return (
+        "ResNet-8 CNN",
+        cnn_best,
+        cnn_score,
+        "Models disagree; CNN passed the threshold rule and has the stronger adjusted score.",
+    )
 
 
 def load_metrics_from_prediction_csv(csv_path):
@@ -185,8 +261,13 @@ class ModelComparisonApp(ctk.CTk):
         self.selected_image = None
         self.selected_image_path = None
         self.preview_image = None
+        self.thermal_image = None
         self.chart_canvas = None
+        self.chart_image = None
+        self.chart_image_label = None
         self.sidebar_pie_canvas = None
+        self.sidebar_pie_image = None
+        self.sidebar_pie_label = None
         self.content_animation_job = None
         self.sidebar_width = 230
         self.sidebar_visible = True
@@ -228,7 +309,11 @@ class ModelComparisonApp(ctk.CTk):
             self.sidebar,
             text=(
                 f"ResNet-8 accuracy\n{CNN_TEST_ACCURACY:.2f}%\n\n"
-                f"ViT-Tiny accuracy\n{VIT_TEST_ACCURACY:.2f}%"
+                f"ViT-Tiny accuracy\n{VIT_TEST_ACCURACY:.2f}%\n\n"
+                f"Min confidence\n{MIN_MODEL_CONFIDENCE * 100:.0f}%\n\n"
+                f"CNN override rule\n"
+                f"{CNN_DISAGREEMENT_CONFIDENCE_THRESHOLD * 100:.0f}% confidence + "
+                f"{DISAGREEMENT_SCORE_MARGIN * 100:.0f}% margin"
             ),
             font=ctk.CTkFont(size=13),
             text_color="#9aa6bd",
@@ -333,9 +418,9 @@ class ModelComparisonApp(ctk.CTk):
         self.draw_sidebar_pie(cnn_score, vit_score)
 
     def draw_sidebar_pie(self, cnn_score=0, vit_score=0):
-        if self.sidebar_pie_canvas is not None:
-            self.sidebar_pie_canvas.get_tk_widget().destroy()
-            self.sidebar_pie_canvas = None
+        if self.sidebar_pie_label is not None and self.sidebar_pie_label.winfo_exists():
+            self.sidebar_pie_label.destroy()
+            self.sidebar_pie_label = None
 
         figure = Figure(figsize=(1.8, 1.55), dpi=100, facecolor="#111827")
         axis = figure.add_subplot(111)
@@ -370,12 +455,21 @@ class ModelComparisonApp(ctk.CTk):
         axis.set_aspect("equal")
         figure.tight_layout(pad=0.25)
 
-        self.sidebar_pie_canvas = FigureCanvasTkAgg(
-            figure,
-            master=self.sidebar_pie_frame,
+        buffer = BytesIO()
+        figure.savefig(buffer, format="png", facecolor="#111827", dpi=100)
+        buffer.seek(0)
+        image = Image.open(buffer).copy()
+        self.sidebar_pie_image = ctk.CTkImage(
+            light_image=image,
+            dark_image=image,
+            size=(180, 155),
         )
-        self.sidebar_pie_canvas.draw()
-        self.sidebar_pie_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.sidebar_pie_label = ctk.CTkLabel(
+            self.sidebar_pie_frame,
+            image=self.sidebar_pie_image,
+            text="",
+        )
+        self.sidebar_pie_label.pack(fill="both", expand=True)
 
     def build_main_area(self):
         self.main = ctk.CTkFrame(self, fg_color="#151927", corner_radius=0)
@@ -394,7 +488,7 @@ class ModelComparisonApp(ctk.CTk):
         self.content.grid_rowconfigure(2, weight=1)
         self.content.grid_rowconfigure(3, weight=0)
 
-        self.show_home_page()
+        self.show_front_page()
 
     def build_top_nav(self):
         nav = ctk.CTkFrame(
@@ -406,27 +500,24 @@ class ModelComparisonApp(ctk.CTk):
             border_width=1,
         )
         nav.grid(row=0, column=0, columnspan=2, sticky="ew")
-        nav.grid_columnconfigure(4, weight=1)
+        nav.grid_columnconfigure(5, weight=1)
         nav.grid_propagate(False)
 
-        logo = ctk.CTkFrame(
+        logo = ctk.CTkButton(
             nav,
+            text="H",
             width=40,
             height=40,
             corner_radius=14,
             fg_color="#7c5cff",
+            hover_color="#6d4df2",
+            text_color="#ffffff",
             border_color="#9d8cff",
             border_width=1,
+            font=ctk.CTkFont(size=22, weight="bold"),
+            command=self.show_front_page,
         )
         logo.grid(row=0, column=0, padx=(16, 8), pady=12)
-        logo.grid_propagate(False)
-
-        ctk.CTkLabel(
-            logo,
-            text="H",
-            text_color="#ffffff",
-            font=ctk.CTkFont(size=22, weight="bold"),
-        ).pack(expand=True)
 
         home_button = ctk.CTkButton(
             nav,
@@ -469,12 +560,25 @@ class ModelComparisonApp(ctk.CTk):
             command=self.show_history_page,
         ).grid(row=0, column=3, padx=6, pady=14)
 
+        ctk.CTkButton(
+            nav,
+            text="Refresh",
+            width=104,
+            height=36,
+            corner_radius=12,
+            fg_color="transparent",
+            hover_color="#1b2133",
+            text_color="#cbd5e1",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self.refresh_current_page,
+        ).grid(row=0, column=4, padx=6, pady=14)
+
         ctk.CTkLabel(
             nav,
             text="HistoScan",
             text_color="#8f9ab0",
             font=ctk.CTkFont(size=18, weight="bold"),
-        ).grid(row=0, column=4, sticky="e", padx=(8, 18))
+        ).grid(row=0, column=5, sticky="e", padx=(8, 18))
 
     def show_sidebar(self):
         self.sidebar_visible = True
@@ -490,24 +594,64 @@ class ModelComparisonApp(ctk.CTk):
         self.main.grid_configure(column=0, columnspan=2, padx=22, pady=(0, 22))
 
     def animate_content_in(self):
-        animate_content_in(self)
+        pass
 
     def clear_content(self):
         if self.content_animation_job is not None:
             self.after_cancel(self.content_animation_job)
             self.content_animation_job = None
         self.chart_canvas = None
+        self.chart_image = None
+        self.chart_image_label = None
         for widget in self.content.winfo_children():
             widget.destroy()
 
     def show_home_page(self):
+        self.current_page = "home"
         render_home_page(self)
 
+    def show_front_page(self):
+        self.current_page = "front"
+        render_front_page(self)
+
     def show_about_page(self):
+        self.current_page = "about"
         render_about_page(self)
 
     def show_history_page(self):
+        self.current_page = "history"
         render_history_page(self)
+
+    def refresh_current_page(self):
+        current_page = getattr(self, "current_page", "home")
+
+        if current_page == "history":
+            self.prediction_history = load_prediction_history()
+            if hasattr(self, "history_visible_count"):
+                del self.history_visible_count
+            self.show_history_page()
+            return
+
+        if current_page == "about":
+            self.show_about_page()
+            return
+
+        if current_page == "front":
+            self.show_front_page()
+            return
+
+        self.selected_image = None
+        self.selected_image_path = None
+        self.preview_image = None
+        self.thermal_image = None
+        if hasattr(self, "sidebar_details_label"):
+            self.sidebar_details_label.configure(text="No image uploaded yet.")
+        if hasattr(self, "sidebar_prediction_label"):
+            self.sidebar_prediction_label.configure(
+                text="Prediction score share will appear here."
+            )
+        self.draw_sidebar_pie()
+        self.show_home_page()
 
     def load_models_async(self):
         Thread(target=self.load_models, daemon=True).start()
@@ -582,15 +726,35 @@ class ModelComparisonApp(ctk.CTk):
 
     def set_busy_state(self):
         self.final_class.configure(text="Analyzing image...")
-        self.final_message.configure(text="ResNet-8 and ViT-Tiny are processing the uploaded image.")
+        self.final_message.configure(
+            text=(
+                "ResNet-8 and ViT-Tiny are processing the uploaded image. "
+                "The winning model thermal map will be generated after prediction."
+            )
+        )
         self.final_score_bar.set(0)
+        if hasattr(self, "thermal_label") and self.thermal_label.winfo_exists():
+            self.thermal_label.configure(
+                image=None,
+                text="Generating after model decision...",
+            )
+        if hasattr(self, "thermal_note") and self.thermal_note.winfo_exists():
+            self.thermal_note.configure(text="Uses the final winning model.")
         self.upload_button.configure(state="disabled", text="Processing...")
 
     def run_prediction(self, image):
         try:
             cnn_results = self.predict_cnn(image)
             vit_results = self.predict_vit(image)
-            self.after(0, lambda: self.display_results(cnn_results, vit_results))
+            thermal_image = self.generate_winning_model_thermal_image(
+                image,
+                cnn_results,
+                vit_results,
+            )
+            self.after(
+                0,
+                lambda: self.display_results(cnn_results, vit_results, thermal_image),
+            )
         except Exception as exc:
             self.after(0, lambda: self.show_prediction_error(exc))
 
@@ -605,33 +769,64 @@ class ModelComparisonApp(ctk.CTk):
         probabilities = torch.softmax(outputs, dim=1)[0].cpu().numpy()
         return ranked_predictions(probabilities, self.vit_class_names)
 
-    def display_results(self, cnn_results, vit_results):
+    def generate_winning_model_thermal_image(self, image, cnn_results, vit_results):
+        cnn_best = cnn_results[0]
+        vit_best = vit_results[0]
+        cnn_score = cnn_best["confidence"] * (CNN_TEST_ACCURACY / 100.0)
+        vit_score = vit_best["confidence"] * (VIT_TEST_ACCURACY / 100.0)
+        winner_name, winner_result, _, _ = (
+            select_final_prediction(cnn_best, vit_best, cnn_score, vit_score)
+        )
+        return create_thermal_overlay(
+            image=image,
+            model_name=winner_name,
+            winner_result=winner_result,
+            cnn_model=self.cnn_model,
+            vit_model=self.vit_model,
+            vit_class_names=self.vit_class_names,
+            cnn_class_names=CNN_CLASS_NAMES,
+            vit_transform=VIT_TRANSFORM,
+            preprocess_for_cnn=preprocess_for_cnn,
+            image_size=IMAGE_SIZE,
+            device=DEVICE,
+        )
+
+    def update_thermal_image(self, thermal_result):
+        if (
+            thermal_result is None
+            or not hasattr(self, "thermal_label")
+            or not self.thermal_label.winfo_exists()
+        ):
+            return
+
+        overlay, model_name, class_name = thermal_result
+        preview = ImageOps.contain(overlay, (520, 300))
+        self.thermal_image = ctk.CTkImage(
+            light_image=preview,
+            dark_image=preview,
+            size=preview.size,
+        )
+        self.thermal_label.configure(image=self.thermal_image, text="")
+        self.thermal_note.configure(
+            text=f"Generated using {model_name} for class {class_name}."
+        )
+
+    def display_results(self, cnn_results, vit_results, thermal_image=None):
         cnn_best = cnn_results[0]
         vit_best = vit_results[0]
 
         cnn_score = cnn_best["confidence"] * (CNN_TEST_ACCURACY / 100.0)
         vit_score = vit_best["confidence"] * (VIT_TEST_ACCURACY / 100.0)
 
-        if vit_score > cnn_score:
-            winner_name = "ViT-Tiny"
-            winner_result = vit_best
-            winner_score = vit_score
-        else:
-            winner_name = "ResNet-8 CNN"
-            winner_result = cnn_best
-            winner_score = cnn_score
-
-        agreement_text = (
-            "Both models agree on the class."
-            if cnn_best["class_name"] == vit_best["class_name"]
-            else "The models disagree, so the stronger score is selected."
+        winner_name, winner_result, winner_score, decision_note = (
+            select_final_prediction(cnn_best, vit_best, cnn_score, vit_score)
         )
 
         self.final_class.configure(text=winner_result["class_name"])
         self.final_message.configure(
             text=(
                 f"Selected from {winner_name}. "
-                f"Final score: {winner_score * 100:.2f}%. {agreement_text}"
+                f"Final score: {winner_score * 100:.2f}%. {decision_note}"
             )
         )
         self.final_score_bar.set(max(0.0, min(1.0, winner_score)))
@@ -652,6 +847,7 @@ class ModelComparisonApp(ctk.CTk):
         )
 
         self.update_metrics_chart(cnn_best, vit_best, cnn_score, vit_score)
+        self.update_thermal_image(thermal_image)
         self.update_sidebar_prediction_summary(
             cnn_best,
             vit_best,
@@ -795,9 +991,9 @@ class ModelComparisonApp(ctk.CTk):
         cnn_best=None,
         vit_best=None,
     ):
-        if self.chart_canvas is not None:
-            self.chart_canvas.get_tk_widget().destroy()
-            self.chart_canvas = None
+        if self.chart_image_label is not None and self.chart_image_label.winfo_exists():
+            self.chart_image_label.destroy()
+            self.chart_image_label = None
 
         labels = labels or ["Precision", "Recall", "F1", "Confidence", "Accuracy", "Score"]
         cnn_values = cnn_values or [0, 0, 0, 0, CNN_TEST_ACCURACY / 100.0, 0]
@@ -855,9 +1051,21 @@ class ModelComparisonApp(ctk.CTk):
 
         figure.tight_layout(pad=1.0)
 
-        self.chart_canvas = FigureCanvasTkAgg(figure, master=self.chart_frame)
-        self.chart_canvas.draw()
-        self.chart_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=8)
+        buffer = BytesIO()
+        figure.savefig(buffer, format="png", facecolor="#111827", dpi=100)
+        buffer.seek(0)
+        image = Image.open(buffer).copy()
+        self.chart_image = ctk.CTkImage(
+            light_image=image,
+            dark_image=image,
+            size=(920, 230),
+        )
+        self.chart_image_label = ctk.CTkLabel(
+            self.chart_frame,
+            image=self.chart_image,
+            text="",
+        )
+        self.chart_image_label.pack(fill="both", expand=True, padx=8, pady=8)
 
     def show_prediction_error(self, exc):
         self.upload_button.configure(state="normal", text="Upload Image")

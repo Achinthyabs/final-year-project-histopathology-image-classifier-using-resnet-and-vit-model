@@ -1,8 +1,20 @@
-tensorflow
-streamlit
-numpy
-pillow
-matplotlib
-scikit-learn
-seaborn
-opencV-python
+# Core desktop UI
+customtkinter==5.2.2
+darkdetect==0.8.0
+packaging==26.2
+
+# Image processing and charts
+pillow==12.2.0
+matplotlib==3.10.9
+numpy==2.4.4
+
+# Metrics and reports
+scikit-learn==1.8.0
+
+# CNN model runtime
+tensorflow==2.21.0
+
+# ViT model runtime
+torch==2.11.0
+torchvision==0.26.0
+timm==1.0.26

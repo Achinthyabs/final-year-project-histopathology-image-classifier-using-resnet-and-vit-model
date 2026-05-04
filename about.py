@@ -1,7 +1,6 @@
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 
-from animations import animate_content_in
 from ui_helpers import make_card
 
 
@@ -100,7 +99,6 @@ def show_about_page(app):
         font=ctk.CTkFont(size=15, weight="bold"),
         command=app.show_home_page,
     ).pack(anchor="center", padx=34, pady=(0, 34))
-    animate_content_in(app)
 
 
 def build_about_metric(parent, title, value, column):
