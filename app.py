@@ -26,7 +26,6 @@ from history import show_history_page as render_history_page
 from home import show_home_page as render_home_page
 from thermal_detection import create_thermal_overlay
 
-
 BASE_DIR = Path(__file__).resolve().parent
 CNN_MODEL_PATH = BASE_DIR / "resnet8_12class_model.keras"
 VIT_MODEL_PATH = (
@@ -261,10 +260,12 @@ class ModelComparisonApp(ctk.CTk):
         self.selected_image = None
         self.selected_image_path = None
         self.preview_image = None
+        self.pipeline_images = []
         self.thermal_image = None
         self.chart_canvas = None
         self.chart_image = None
         self.chart_image_label = None
+        self.model_heatmap_images = []
         self.sidebar_pie_canvas = None
         self.sidebar_pie_image = None
         self.sidebar_pie_label = None
@@ -643,6 +644,7 @@ class ModelComparisonApp(ctk.CTk):
         self.selected_image = None
         self.selected_image_path = None
         self.preview_image = None
+        self.pipeline_images = []
         self.thermal_image = None
         if hasattr(self, "sidebar_details_label"):
             self.sidebar_details_label.configure(text="No image uploaded yet.")
@@ -712,6 +714,7 @@ class ModelComparisonApp(ctk.CTk):
         self.file_label.configure(text=Path(file_path).name)
         self.update_sidebar_image_info(self.selected_image_path, image)
         self.show_preview(image)
+        self.update_pipeline_images(image)
         self.set_busy_state()
         Thread(target=self.run_prediction, args=(image,), daemon=True).start()
 
@@ -723,6 +726,50 @@ class ModelComparisonApp(ctk.CTk):
             size=preview.size,
         )
         self.preview_label.configure(image=self.preview_image, text="")
+
+    def update_pipeline_images(self, image):
+        """Render the requested 224 x 224 image-preprocessing visualizations."""
+        if not hasattr(self, "pipeline_image_labels"):
+            return
+
+        resized = image.resize(IMAGE_SIZE)
+        pixels = np.asarray(resized, dtype=np.float32)
+        channel_min = pixels.min(axis=(0, 1), keepdims=True)
+        channel_max = pixels.max(axis=(0, 1), keepdims=True)
+        channel_range = np.maximum(channel_max - channel_min, 1.0)
+        normalized_pixels = (pixels - channel_min) / channel_range * 255.0
+        color_normalized = Image.fromarray(
+            np.uint8(np.clip(normalized_pixels, 0, 255)), mode="RGB"
+        )
+        equalized = ImageOps.equalize(color_normalized)
+
+        # JPEG re-encoding creates a realistic compressed-image preview.
+        compressed_buffer = BytesIO()
+        equalized.save(compressed_buffer, format="JPEG", quality=35, optimize=True)
+        compressed_buffer.seek(0)
+        compressed = Image.open(compressed_buffer).convert("RGB")
+
+        stages = [resized, color_normalized, equalized, compressed]
+        self.pipeline_images = []
+        for stage, label in zip(stages, self.pipeline_image_labels):
+            preview = ImageOps.contain(stage, (190, 145))
+            rendered = ctk.CTkImage(
+                light_image=preview,
+                dark_image=preview,
+                size=preview.size,
+            )
+            self.pipeline_images.append(rendered)
+            label.configure(image=rendered, text="")
+
+        if hasattr(self, "pipeline_note"):
+            self.pipeline_note.configure(
+                text=(
+                    "All stages use a 224 × 224 image: resizing → per-channel color "
+                    "normalization → histogram equalization → JPEG compression preview. "
+                    "These previews explain the image pipeline; model inference retains "
+                    "its trained CNN/ViT preprocessing."
+                )
+            )
 
     def set_busy_state(self):
         self.final_class.configure(text="Analyzing image...")
@@ -769,13 +816,43 @@ class ModelComparisonApp(ctk.CTk):
         probabilities = torch.softmax(outputs, dim=1)[0].cpu().numpy()
         return ranked_predictions(probabilities, self.vit_class_names)
 
+    def generate_model_heatmaps(self, image, cnn_results, vit_results):
+        """Generate model-specific occlusion heatmaps for side-by-side comparison."""
+        cnn_heatmap = create_thermal_overlay(
+            image=image,
+            model_name="ResNet-8 CNN",
+            winner_result=cnn_results[0],
+            cnn_model=self.cnn_model,
+            vit_model=self.vit_model,
+            vit_class_names=self.vit_class_names,
+            cnn_class_names=CNN_CLASS_NAMES,
+            vit_transform=VIT_TRANSFORM,
+            preprocess_for_cnn=preprocess_for_cnn,
+            image_size=IMAGE_SIZE,
+            device=DEVICE,
+        )
+        vit_heatmap = create_thermal_overlay(
+            image=image,
+            model_name="ViT-Tiny",
+            winner_result=vit_results[0],
+            cnn_model=self.cnn_model,
+            vit_model=self.vit_model,
+            vit_class_names=self.vit_class_names,
+            cnn_class_names=CNN_CLASS_NAMES,
+            vit_transform=VIT_TRANSFORM,
+            preprocess_for_cnn=preprocess_for_cnn,
+            image_size=IMAGE_SIZE,
+            device=DEVICE,
+        )
+        return cnn_heatmap, vit_heatmap
+
     def generate_winning_model_thermal_image(self, image, cnn_results, vit_results):
         cnn_best = cnn_results[0]
         vit_best = vit_results[0]
         cnn_score = cnn_best["confidence"] * (CNN_TEST_ACCURACY / 100.0)
         vit_score = vit_best["confidence"] * (VIT_TEST_ACCURACY / 100.0)
-        winner_name, winner_result, _, _ = (
-            select_final_prediction(cnn_best, vit_best, cnn_score, vit_score)
+        winner_name, winner_result, _, _ = select_final_prediction(
+            cnn_best, vit_best, cnn_score, vit_score
         )
         return create_thermal_overlay(
             image=image,
@@ -809,6 +886,125 @@ class ModelComparisonApp(ctk.CTk):
         self.thermal_label.configure(image=self.thermal_image, text="")
         self.thermal_note.configure(
             text=f"Generated using {model_name} for class {class_name}."
+        )
+
+    def update_model_heatmaps(self, model_heatmaps):
+        if (
+            not model_heatmaps
+            or not hasattr(self, "model_heatmap_labels")
+        ):
+            return
+
+        self.model_heatmap_images = []
+        for heatmap_result, label in zip(model_heatmaps, self.model_heatmap_labels):
+            overlay, model_name, class_name = heatmap_result
+            preview = ImageOps.contain(overlay, (500, 285))
+            rendered = ctk.CTkImage(
+                light_image=preview,
+                dark_image=preview,
+                size=preview.size,
+            )
+            self.model_heatmap_images.append(rendered)
+            label.configure(image=rendered, text="")
+
+        if hasattr(self, "analysis_note"):
+            cnn_class = model_heatmaps[0][2]
+            vit_class = model_heatmaps[1][2]
+            self.analysis_note.configure(
+                text=(
+                    f"CNN attention is shown for {cnn_class}; ViT attention is shown "
+                    f"for {vit_class}. Warmer regions have greater influence on each model's prediction."
+                )
+            )
+
+    def update_analysis_charts(self, cnn_results, vit_results, cnn_score, vit_score):
+        """Create complementary visual comparisons of the two classifier outputs."""
+        if not hasattr(self, "analysis_chart_labels"):
+            return
+
+        cnn_color = "#6f7cff"
+        vit_color = "#2dd4bf"
+        top_classes = []
+        for result in cnn_results[:5] + vit_results[:5]:
+            if result["class_name"] not in top_classes:
+                top_classes.append(result["class_name"])
+        top_classes = top_classes[:8]
+        cnn_scores = {
+            result["class_name"]: result["confidence"] * 100 for result in cnn_results
+        }
+        vit_scores = {
+            result["class_name"]: result["confidence"] * 100 for result in vit_results
+        }
+
+        figures = []
+        heatmap_figure = Figure(figsize=(3.45, 2.15), dpi=100, facecolor="#111827")
+        heatmap_axis = heatmap_figure.add_subplot(111, facecolor="#111827")
+        heatmap_values = np.array(
+            [
+                [cnn_scores.get(name, 0) for name in top_classes],
+                [vit_scores.get(name, 0) for name in top_classes],
+            ]
+        )
+        heatmap = heatmap_axis.imshow(heatmap_values, aspect="auto", cmap="magma", vmin=0, vmax=max(100, heatmap_values.max()))
+        heatmap_axis.set_title("Class probability heatmap", color="#f7f8fc", fontsize=10)
+        heatmap_axis.set_xticks(np.arange(len(top_classes)), top_classes, rotation=38, ha="right", fontsize=7, color="#d8dee9")
+        heatmap_axis.set_yticks([0, 1], ["CNN", "ViT"], fontsize=8, color="#d8dee9")
+        for row, values in enumerate(heatmap_values):
+            for column, value in enumerate(values):
+                text_color = "#111827" if value > 55 else "#f7f8fc"
+                heatmap_axis.text(column, row, f"{value:.1f}", ha="center", va="center", color=text_color, fontsize=7)
+        colorbar = heatmap_figure.colorbar(heatmap, ax=heatmap_axis, fraction=0.05, pad=0.03)
+        colorbar.set_label("Probability (%)", color="#d8dee9", fontsize=7)
+        colorbar.ax.tick_params(colors="#d8dee9", labelsize=7)
+        heatmap_figure.tight_layout(pad=1.0)
+        figures.append(heatmap_figure)
+
+        line_figure = Figure(figsize=(3.45, 2.15), dpi=100, facecolor="#111827")
+        line_axis = line_figure.add_subplot(111, facecolor="#111827")
+        ranks = np.arange(1, 6)
+        line_axis.plot(ranks, [item["confidence"] * 100 for item in cnn_results[:5]], "o-", color=cnn_color, label="CNN")
+        line_axis.plot(ranks, [item["confidence"] * 100 for item in vit_results[:5]], "s-", color=vit_color, label="ViT")
+        line_axis.set_title("Confidence curve by rank", color="#f7f8fc", fontsize=10)
+        line_axis.set_xlabel("Rank", color="#d8dee9", fontsize=8)
+        line_axis.set_ylabel("Probability (%)", color="#d8dee9", fontsize=8)
+        line_axis.set_xticks(ranks)
+        line_axis.tick_params(colors="#d8dee9", labelsize=7)
+        line_axis.grid(alpha=0.18, color="#d8dee9")
+        line_axis.legend(fontsize=7, facecolor="#1b2133", labelcolor="#f7f8fc", frameon=False)
+        for spine in line_axis.spines.values():
+            spine.set_visible(False)
+        line_figure.tight_layout(pad=1.0)
+        figures.append(line_figure)
+
+        accuracy_figure = Figure(figsize=(3.45, 2.15), dpi=100, facecolor="#111827")
+        accuracy_axis = accuracy_figure.add_subplot(111, facecolor="#111827")
+        model_names = ["ResNet-8\nCNN", "ViT-Tiny"]
+        accuracies = [CNN_TEST_ACCURACY, VIT_TEST_ACCURACY]
+        accuracy_bars = accuracy_axis.bar(model_names, accuracies, color=[cnn_color, vit_color], width=0.55)
+        accuracy_axis.set_ylim(0, 100)
+        accuracy_axis.set_title("Held-out test accuracy", color="#f7f8fc", fontsize=10)
+        accuracy_axis.set_ylabel("Accuracy (%)", color="#d8dee9", fontsize=8)
+        accuracy_axis.tick_params(colors="#d8dee9", labelsize=8)
+        accuracy_axis.grid(axis="y", alpha=0.18, color="#d8dee9")
+        for bar, accuracy in zip(accuracy_bars, accuracies):
+            accuracy_axis.text(bar.get_x() + bar.get_width() / 2, accuracy + 2, f"{accuracy:.2f}%", ha="center", color="#f7f8fc", fontsize=9, weight="bold")
+        for spine in accuracy_axis.spines.values():
+            spine.set_visible(False)
+        accuracy_figure.tight_layout(pad=1.0)
+        figures.append(accuracy_figure)
+
+        self.analysis_images = []
+        for figure, label in zip(figures, self.analysis_chart_labels):
+            buffer = BytesIO()
+            figure.savefig(buffer, format="png", facecolor="#111827", dpi=100)
+            buffer.seek(0)
+            chart = Image.open(buffer).copy()
+            rendered = ctk.CTkImage(light_image=chart, dark_image=chart, size=(345, 215))
+            self.analysis_images.append(rendered)
+            label.configure(image=rendered, text="")
+
+        self.analysis_note.configure(
+            text="The heatmap compares class probabilities, the curve shows confidence by prediction rank, and the bar chart compares each model's held-out test accuracy."
         )
 
     def display_results(self, cnn_results, vit_results, thermal_image=None):
@@ -847,6 +1043,7 @@ class ModelComparisonApp(ctk.CTk):
         )
 
         self.update_metrics_chart(cnn_best, vit_best, cnn_score, vit_score)
+        self.update_analysis_charts(cnn_results, vit_results, cnn_score, vit_score)
         self.update_thermal_image(thermal_image)
         self.update_sidebar_prediction_summary(
             cnn_best,
@@ -955,14 +1152,13 @@ class ModelComparisonApp(ctk.CTk):
             f1_score,
             best["confidence"],
             accuracy / 100.0,
-            score,
         ]
 
     def update_metrics_chart(self, cnn_best, vit_best, cnn_score, vit_score):
         if not hasattr(self, "chart_frame") or not self.chart_frame.winfo_exists():
             return
 
-        labels = ["Precision", "Recall", "F1", "Confidence", "Accuracy", "Score"]
+        labels = ["Precision", "Recall", "F1", "Confidence", "Accuracy"]
         cnn_values = self.metric_values_for_chart(
             cnn_best,
             cnn_score,
@@ -995,9 +1191,9 @@ class ModelComparisonApp(ctk.CTk):
             self.chart_image_label.destroy()
             self.chart_image_label = None
 
-        labels = labels or ["Precision", "Recall", "F1", "Confidence", "Accuracy", "Score"]
-        cnn_values = cnn_values or [0, 0, 0, 0, CNN_TEST_ACCURACY / 100.0, 0]
-        vit_values = vit_values or [0, 0, 0, 0, VIT_TEST_ACCURACY / 100.0, 0]
+        labels = labels or ["Precision", "Recall", "F1", "Confidence", "Accuracy"]
+        cnn_values = cnn_values or [0, 0, 0, 0, CNN_TEST_ACCURACY / 100.0]
+        vit_values = vit_values or [0, 0, 0, 0, VIT_TEST_ACCURACY / 100.0]
 
         figure = Figure(figsize=(9.2, 2.3), dpi=100, facecolor="#111827")
         axis = figure.add_subplot(111)
